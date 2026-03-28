@@ -12,7 +12,6 @@ COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY src/ ./src/
-COPY .env.example ./.env.example
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN sed -i 's/\r//' ./docker-entrypoint.sh && chmod +x ./docker-entrypoint.sh
 
