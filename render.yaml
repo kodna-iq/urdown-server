@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: urdown-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: LOG_LEVEL
+        value: info
+      - key: RATE_LIMIT
+        value: 120
+      - key: AUTO_UPDATE_INTERVAL_MS
+        value: 21600000
+      - key: AI_ADVISOR_WINDOW_HOURS
+        value: 24
+      - key: API_KEY
+        generateValue: true
+      - key: ANTHROPIC_API_KEY
+        sync: false
