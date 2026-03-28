@@ -69,6 +69,7 @@ const { evaluateRules, analyzeClientPerformance } = require('./engine/rule_engin
 const { processEvent, pruneOldTelemetry }         = require('./engine/telemetry_processor');
 const { startCron: startVersionCron, getLatestVersions } = require('./engine/version_tracker');
 const { validateApiKey, validateAdmin } = require('./middleware/auth');
+const { pickCookie, markCookieFailed }  = require('./engine/cookie_manager');
 
 // ── Routes الأصلية ────────────────────────────────────────────────────────────
 const resolveRouter   = require('./routes/resolve');
@@ -76,6 +77,76 @@ const extractRouter   = require('./routes/extract');
 const telemetryRouter = require('./routes/telemetry');
 const adminRouter     = require('./routes/admin');
 const aiRouter        = require('./routes/ai');
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  URL Security — حماية من SSRF والروابط المشبوهة
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const BLOCKED_HOSTS = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|::1|fd[0-9a-f]{2}:)/i;
+
+function validateUrl(url) {
+  if (!url || typeof url !== 'string') return { ok: false, reason: 'url missing' };
+  if (url.length > 2048)              return { ok: false, reason: 'url too long' };
+
+  let parsed;
+  try { parsed = new URL(url); } catch { return { ok: false, reason: 'invalid url format' }; }
+
+  if (!['http:', 'https:'].includes(parsed.protocol))
+    return { ok: false, reason: 'only http/https allowed' };
+
+  const host = parsed.hostname.toLowerCase();
+  if (BLOCKED_HOSTS.test(host))
+    return { ok: false, reason: 'private/loopback addresses not allowed' };
+
+  return { ok: true };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  تنظيف ملفات tmp القديمة — يُشغَّل كل 5 دقائق
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const TMP_MAX_AGE_MS = parseInt(process.env.TMP_MAX_AGE_MS || String(10 * 60 * 1000)); // 10 دقائق
+const TMP_MAX_SIZE_BYTES = parseInt(process.env.TMP_MAX_SIZE_MB || '2048') * 1024 * 1024;
+
+function cleanTmpDir() {
+  try {
+    const files  = fs.readdirSync(TMP_DIR);
+    const now    = Date.now();
+    let   cleaned = 0;
+    let   totalSize = 0;
+
+    const fileStats = files.map(f => {
+      const fp = path.join(TMP_DIR, f);
+      try {
+        const st = fs.statSync(fp);
+        totalSize += st.size;
+        return { fp, mtime: st.mtimeMs, size: st.size };
+      } catch { return null; }
+    }).filter(Boolean);
+
+    // حذف الملفات الأقدم من TMP_MAX_AGE_MS
+    for (const { fp, mtime } of fileStats) {
+      if (now - mtime > TMP_MAX_AGE_MS) {
+        try { fs.unlinkSync(fp); cleaned++; } catch (_) {}
+      }
+    }
+
+    // إذا تجاوز الحجم الكلي الحد الأقصى، احذف الأقدم أولاً
+    if (totalSize > TMP_MAX_SIZE_BYTES) {
+      const sorted = fileStats.sort((a, b) => a.mtime - b.mtime);
+      let sz = totalSize;
+      for (const { fp, size } of sorted) {
+        if (sz <= TMP_MAX_SIZE_BYTES) break;
+        try { fs.unlinkSync(fp); sz -= size; cleaned++; } catch (_) {}
+      }
+      logger.warn(`[tmp-clean] disk limit exceeded — freed ${(totalSize - sz / 1024 / 1024).toFixed(1)}MB`);
+    }
+
+    if (cleaned > 0) logger.info(`[tmp-clean] removed ${cleaned} stale file(s)`);
+  } catch (e) {
+    logger.warn(`[tmp-clean] ${e.message}`);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  تحديث yt-dlp تلقائياً
@@ -175,6 +246,19 @@ function runYtDlp(args, timeoutMs = 30_000) {
 async function proxyDownload(url, platform, format, res) {
   const tmpFile = path.join(TMP_DIR, `dl_${Date.now()}_${Math.random().toString(36).slice(2)}`);
   const platformArgs = buildPlatformArgs(url, platform);
+
+  // ── FIX: دمج Cookie Manager ───────────────────────────────────────────────
+  // تحقق من إعداد use_cookies للمنصة ثم اختر كوكي متاح
+  let activeCookiePath = null;
+  const platformCfg = stmts.getConfig.get(platform) || stmts.getConfig.get('generic');
+  if (platformCfg && platformCfg.use_cookies) {
+    activeCookiePath = pickCookie(platform);
+    if (activeCookiePath) {
+      platformArgs.push('--cookies', activeCookiePath);
+      logger.info(`[proxy-download] using cookie: ${path.basename(activeCookiePath)}`);
+    }
+  }
+
   const formatStr = format === 'audio'
     ? 'bestaudio[ext=m4a]/bestaudio'
     : 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best';
@@ -202,6 +286,13 @@ async function proxyDownload(url, platform, format, res) {
     stream.pipe(res);
     stream.on('close', () => { try { fs.unlinkSync(filePath); } catch (_) {} });
   } catch (err) {
+    // ── FIX: تعليم الكوكي على أنها فاشلة عند 403 ────────────────────────────
+    const is403 = /403|forbidden/i.test(err.message);
+    if (is403 && activeCookiePath) {
+      markCookieFailed(activeCookiePath);
+      logger.warn(`[proxy-download] 403 detected — cookie marked failed: ${path.basename(activeCookiePath)}`);
+    }
+
     try {
       fs.readdirSync(TMP_DIR)
         .filter(f => f.startsWith(path.basename(tmpFile)))
@@ -233,6 +324,17 @@ app.use(limiter);
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
+  // احسب حجم tmp الحالي
+  let tmpSizeBytes = 0;
+  let tmpFileCount = 0;
+  try {
+    const files = fs.readdirSync(TMP_DIR);
+    tmpFileCount = files.length;
+    for (const f of files) {
+      try { tmpSizeBytes += fs.statSync(path.join(TMP_DIR, f)).size; } catch (_) {}
+    }
+  } catch (_) {}
+
   res.json({
     status:      'ok',
     uptime:      Math.floor((Date.now() - state.startTime) / 1000),
@@ -241,6 +343,11 @@ app.get('/health', (req, res) => {
     requests:    state.requestCount,
     errors:      state.errorCount,
     version:     require('../package.json').version,
+    tmp: {
+      files:   tmpFileCount,
+      sizeMB:  (tmpSizeBytes / 1024 / 1024).toFixed(2),
+      maxMB:   Math.floor(TMP_MAX_SIZE_BYTES / 1024 / 1024),
+    },
   });
 });
 
@@ -256,6 +363,14 @@ app.use('/ai',        aiRouter);         // GET /ai/advisor — AI analysis
 app.post('/v2/proxy-download', validateApiKey, async (req, res) => {
   const { url, platform, format } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
+
+  // ── FIX: SSRF + URL validation ────────────────────────────────────────────
+  const urlCheck = validateUrl(url);
+  if (!urlCheck.ok) {
+    logger.warn(`[proxy-download] rejected url: ${urlCheck.reason} — ${url.slice(0, 80)}`);
+    return res.status(400).json({ error: urlCheck.reason, code: 'invalid_url' });
+  }
+
   logger.info(`[proxy-download] ${platform || 'generic'} ${url.slice(0, 80)}`);
   try {
     await proxyDownload(url, platform || 'generic', format || 'video', res);
@@ -330,6 +445,12 @@ app.listen(PORT, '0.0.0.0', async () => {
   setInterval(() => {
     try { pruneOldTelemetry(); } catch (e) { logger.warn(`[prune] ${e.message}`); }
   }, 24 * 60 * 60 * 1000);
+
+  // ── FIX: تنظيف tmp كل 5 دقائق لمنع تراكم الملفات المتسربة ─────────────
+  cleanTmpDir(); // تنظيف فوري عند بدء التشغيل
+  setInterval(() => {
+    try { cleanTmpDir(); } catch (e) { logger.warn(`[tmp-clean] ${e.message}`); }
+  }, 5 * 60 * 1000);
 
   logger.info('All engines started.');
 });
