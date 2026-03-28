@@ -8,11 +8,30 @@
 //          to platforms list (was missing — live platform data was never analyzed)
 // FIX-RE2  _tryRestoreDefaults: extended to handle all platforms (not just youtube)
 // FIX-RE3  analyzeClientPerformance: skip live platforms (they have no clients)
+// FIX-RE4  analyzeClientPerformance: generalized to all non-live platforms
+//          (was only adjusting youtube clients — tiktok/instagram/facebook ignored)
+// FIX-RE5  evaluateRules: added cooldown check to prevent oscillation
+//          (rule changes won't re-fire for 30 minutes on the same platform)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { db, stmts }        = require('../db/database');
 const { applyConfigPatch } = require('./strategy_engine');
 const logger               = require('../middleware/logger');
+
+// ── FIX-RE5: cooldown map لمنع الـ oscillation (30 دقيقة) ───────────────────
+// المفتاح: `${platform}:${ruleNumber}` — القيمة: timestamp آخر تغيير
+const RULE_COOLDOWN_MS = parseInt(process.env.RULE_COOLDOWN_MS || String(30 * 60 * 1000));
+const ruleCooldowns    = new Map();
+
+function isRuleCoolingDown(platform, ruleNum) {
+  const key  = `${platform}:${ruleNum}`;
+  const last = ruleCooldowns.get(key) || 0;
+  return (Date.now() - last) < RULE_COOLDOWN_MS;
+}
+
+function markRuleFired(platform, ruleNum) {
+  ruleCooldowns.set(`${platform}:${ruleNum}`, Date.now());
+}
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
@@ -51,29 +70,32 @@ function _evaluatePlatform(platform) {
     const cfg = stmts.getConfig.get('youtube');
     if (!cfg) return;
     const clients = JSON.parse(cfg.clients || '[]');
-    if (clients.includes('android') && clients[0] !== 'ios') {
+    if (clients.includes('android') && clients[0] !== 'ios' && !isRuleCoolingDown(platform, 1)) {
       applyConfigPatch('youtube', {
         clients:  ['ios', 'android'],
         fallback: ['android_vr', 'web_safari', 'web'],
       });
+      markRuleFired(platform, 1);
       logger.warn(`[rule-engine] RULE 1: youtube 403×${forbidden403} → ios promoted`);
     }
   }
 
   // Rule 2: noFormats spike → force HLS (skip live platforms, already HLS)
   const isLive = platform.endsWith('_live');
-  if (noFormats >= 5 && !_getForceHls(platform) && !isLive) {
+  if (noFormats >= 5 && !_getForceHls(platform) && !isLive && !isRuleCoolingDown(platform, 2)) {
     applyConfigPatch(platform, { force_hls: true });
+    markRuleFired(platform, 2);
     logger.warn(`[rule-engine] RULE 2: ${platform} noFormats×${noFormats} → force_hls=true`);
   }
 
   // Rule 3: >80% failure rate → force HLS + reset clients (skip live platforms)
-  if (failRate > 0.80 && totalAttempts >= 10 && !isLive) {
+  if (failRate > 0.80 && totalAttempts >= 10 && !isLive && !isRuleCoolingDown(platform, 3)) {
     applyConfigPatch(platform, {
       force_hls: true,
       clients:   platform === 'youtube' ? ['ios'] : [],
       fallback:  platform === 'youtube' ? ['android_vr', 'web_safari', 'web'] : [],
     });
+    markRuleFired(platform, 3);
     logger.error(
       `[rule-engine] RULE 3: ${platform} failRate=${(failRate*100).toFixed(0)}% → EMERGENCY HLS`
     );
@@ -115,47 +137,58 @@ function _tryRestoreDefaults(platform) {
 }
 
 // ── Client performance analyzer ───────────────────────────────────────────────
+// FIX-RE4: generalized to ALL non-live platforms (was youtube-only)
 
 function analyzeClientPerformance() {
   try {
     const rows = db.prepare(`
-      SELECT client_used, success, COUNT(*) as cnt, AVG(elapsed_ms) as avg_ms
+      SELECT platform, client_used, success, COUNT(*) as cnt, AVG(elapsed_ms) as avg_ms
       FROM telemetry
       WHERE created_at > unixepoch() - 3600
         AND client_used IS NOT NULL
         AND client_used != ''
-      GROUP BY client_used, success
+      GROUP BY platform, client_used, success
     `).all();
 
-    const clients = {};
+    // تجميع الأداء بحسب المنصة والـ client
+    const byPlatform = {};
     for (const row of rows) {
-      if (!clients[row.client_used]) clients[row.client_used] = { ok: 0, fail: 0, avgMs: 0 };
+      if (row.platform.endsWith('_live')) continue; // FIX-RE3: skip live
+      if (!byPlatform[row.platform]) byPlatform[row.platform] = {};
+      if (!byPlatform[row.platform][row.client_used])
+        byPlatform[row.platform][row.client_used] = { ok: 0, fail: 0, avgMs: 0 };
+
+      const entry = byPlatform[row.platform][row.client_used];
       if (row.success) {
-        clients[row.client_used].ok    += row.cnt;
-        clients[row.client_used].avgMs  = row.avg_ms;
+        entry.ok   += row.cnt;
+        entry.avgMs = row.avg_ms;
       } else {
-        clients[row.client_used].fail += row.cnt;
+        entry.fail += row.cnt;
       }
     }
 
-    const problems = Object.entries(clients)
-      .filter(([, v]) => {
-        const total = v.ok + v.fail;
-        return total >= 5 && (v.fail / total) > 0.70;
-      })
-      .map(([client]) => client);
+    // لكل منصة، حدّد الـ clients الفاشلة وحذفها من الإعداد
+    for (const [platform, clients] of Object.entries(byPlatform)) {
+      const failingClients = Object.entries(clients)
+        .filter(([, v]) => {
+          const total = v.ok + v.fail;
+          return total >= 5 && (v.fail / total) > 0.70;
+        })
+        .map(([client]) => client);
 
-    if (problems.length > 0) {
-      logger.warn(`[rule-engine] Underperforming clients: ${problems.join(', ')}`);
-      // FIX-RE3: only re-rank non-live youtube config
-      const ytCfg = stmts.getConfig.get('youtube');
-      if (ytCfg) {
-        const primary = JSON.parse(ytCfg.clients || '[]')
-            .filter(c => !problems.includes(c));
-        if (primary.length > 0) {
-          applyConfigPatch('youtube', { clients: primary });
-          logger.info(`[rule-engine] youtube primary clients → ${primary.join('+')}`);
-        }
+      if (failingClients.length === 0) continue;
+
+      logger.warn(`[rule-engine] ${platform}: underperforming clients: ${failingClients.join(', ')}`);
+
+      const cfg = stmts.getConfig.get(platform);
+      if (!cfg) continue;
+
+      const currentClients = JSON.parse(cfg.clients || '[]');
+      const newClients     = currentClients.filter(c => !failingClients.includes(c));
+
+      if (newClients.length > 0 && newClients.length < currentClients.length) {
+        applyConfigPatch(platform, { clients: newClients });
+        logger.info(`[rule-engine] ${platform} clients updated → ${newClients.join('+')}`);
       }
     }
   } catch (e) {
