@@ -13,8 +13,8 @@ const path    = require('path');
 const fs      = require('fs');
 const { spawn } = require('child_process');
 
-const { validateApiKey }          = require('../middleware/auth');
-const { pickCookie, markCookieFailed } = require('../engine/cookie_manager');
+const { validateApiKey }                              = require('../middleware/auth');
+const { pickCookie, markCookieFailed, releaseCookie } = require('../engine/cookie_store');
 const logger = require('../middleware/logger');
 
 const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
@@ -147,14 +147,20 @@ async function proxyDownload(url, platform, format, res, db) {
 
     const stream = fs.createReadStream(filePath);
     stream.pipe(res);
-    stream.on('close', () => { try { fs.unlinkSync(filePath); } catch (_) {} });
+    stream.on('close', () => {
+      try { fs.unlinkSync(filePath); } catch (_) {}
+      // Release cookie tmp file after download completes
+      if (activeCookiePath) releaseCookie(activeCookiePath);
+    });
 
   } catch (err) {
-    // Mark cookie as failed on 403
+    // Mark cookie as failed on 403, release on other errors
     const is403 = /403|forbidden/i.test(err.message);
     if (is403 && activeCookiePath) {
       try { markCookieFailed(activeCookiePath); } catch (_) {}
       logger.warn(`[proxy-download] 403 — cookie marked failed: ${path.basename(activeCookiePath)}`);
+    } else if (activeCookiePath) {
+      try { releaseCookie(activeCookiePath); } catch (_) {}
     }
     // Clean up any partial tmp files
     try {
