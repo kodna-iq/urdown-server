@@ -119,7 +119,7 @@ router.post('/heal/:platform', (req, res) => {
 //   GET  /admin/cookies
 //   POST /admin/cookies/unblock   { "file": "fb_1.txt" }
 
-const { getCookieStatus, unblockCookie, COOKIES_DIR } = require('../engine/cookie_manager');
+const { getCookieStatus, unblockCookie, COOKIES_DIR } = require('../engine/cookie_store');
 const path = require('path');
 
 router.get('/cookies', validateAdmin, (req, res) => {
@@ -140,6 +140,47 @@ router.post('/cookies/unblock', validateAdmin, (req, res) => {
   unblockCookie(fullPath);
   logger.info(`[admin] cookie unblocked: ${safeName}`);
   res.json({ ok: true, file: safeName });
+});
+
+// ── Monitor endpoints ─────────────────────────────────────────────────────────
+// GET  /admin/monitor/status  → حالة نظام المراقبة
+// POST /admin/monitor/report  → إرسال تقرير فوري على الإيميل
+
+const { runCheck, sendManualReport } = require('../engine/smart_monitor');
+
+router.get('/monitor/status', validateAdmin, async (req, res) => {
+  const emailConfigured = !!(process.env.ALERT_EMAIL && process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+  const aiConfigured    = !!(process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10);
+  res.json({
+    ok:               true,
+    email_configured: emailConfigured,
+    ai_configured:    aiConfigured,
+    alert_email:      process.env.ALERT_EMAIL ? '✅ مضبوط' : '❌ غير مضبوط',
+    gmail_user:       process.env.GMAIL_USER  ? '✅ مضبوط' : '❌ غير مضبوط',
+    gmail_password:   process.env.GMAIL_APP_PASSWORD ? '✅ مضبوط' : '❌ غير مضبوط',
+    interval_min:     parseInt(process.env.MONITOR_INTERVAL_MIN || '30'),
+    ready:            emailConfigured && aiConfigured,
+  });
+});
+
+router.post('/monitor/report', validateAdmin, async (req, res) => {
+  try {
+    logger.info('[admin] طلب تقرير يدوي');
+    const result = await sendManualReport();
+    res.json(result);
+  } catch (e) {
+    logger.error(`[admin/monitor/report] ${e.message}`);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/monitor/check', validateAdmin, async (req, res) => {
+  try {
+    const result = await runCheck();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 module.exports = router;
