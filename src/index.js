@@ -79,9 +79,21 @@ const telemetryRouter = require('./routes/telemetry');
 const adminRouter     = require('./routes/admin');
 const aiRouter        = require('./routes/ai');
 const proxyRouter     = require('./routes/proxy');
+const cookiesRouter   = require('./routes/cookies');
 
-// Inject db dependency into proxy router
+// Inject db into proxy router
 proxyRouter.setDb({ stmts });
+
+// ── Cookie Store — تهيئة فورية قبل أي طلب ────────────────────────────────────
+// يجلب الكوكيز من GitHub ويحفظها في RAM.
+// يجب استدعاؤه هنا بدلاً من داخل app.listen لأن
+// remote_extractor و proxy قد يتلقيان طلبات قبل اكتمال listen.
+const cookieStore = require('./engine/cookie_store');
+cookieStore.init().then(() => {
+  logger.info('[init] Cookie store ready');
+}).catch(e => {
+  logger.warn(`[init] Cookie store init failed (non-fatal): ${e.message}`);
+});
 
 // ── tmp cleaner ───────────────────────────────────────────────────────────────
 function cleanTmpDir() {
@@ -249,6 +261,7 @@ app.use('/extract',   extractRouter);
 app.use('/telemetry', telemetryRouter);
 app.use('/admin',     adminRouter);
 app.use('/ai',        aiRouter);
+app.use('/cookies',   cookiesRouter);
 
 // ── Proxy download (extracted to routes/proxy.js) ─────────────────────────────
 app.use('/v2/proxy-download', proxyRouter);
@@ -325,6 +338,10 @@ app.listen(PORT, '0.0.0.0', async () => {
   setInterval(() => {
     try { cleanTmpDir(); } catch (e) { logger.warn(`[tmp-clean] ${e.message}`); }
   }, 5 * 60 * 1000);
+
+  // ── Smart Monitor — مراقبة الكوكيز وإرسال تنبيهات بالإيميل ───────────────
+  const { startMonitor } = require('./engine/smart_monitor');
+  startMonitor();
 
   logger.info('All engines started.');
 });
