@@ -26,7 +26,7 @@
 const { spawn }     = require('child_process');
 const axios         = require('axios');
 const logger        = require('../middleware/logger');
-const cookieManager = require('../engine/cookie_manager');
+const cookieManager = require('../engine/cookie_store');
 
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE  = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
@@ -189,6 +189,10 @@ async function _extractYtDlp(url) {
 
   try {
     const raw = await _spawnYtDlp(url, args);
+
+    // Release tmp file after yt-dlp finishes (success path)
+    if (usedCookie) cookieManager.releaseCookie(usedCookie);
+
     if (!raw) return null;
 
     const info = JSON.parse(raw.trim().split('\n').pop());
@@ -209,10 +213,12 @@ async function _extractYtDlp(url) {
 
     return null;
   } catch (e) {
-    // [2] إذا فشل بـ 403/auth → علّم الكوكي المستخدمة
+    // فشل بـ 403/auth → علّم الكوكي ثم احذف الملف المؤقت
     const msg = (e.message || '').toLowerCase();
     if (usedCookie && (msg.includes('403') || msg.includes('forbidden') || msg.includes('login') || msg.includes('sign in'))) {
-      cookieManager.markCookieFailed(usedCookie);
+      cookieManager.markCookieFailed(usedCookie); // يحذف الملف المؤقت داخلياً
+    } else if (usedCookie) {
+      cookieManager.releaseCookie(usedCookie);    // احذف الملف في بقية الأخطاء
     }
     logger.warn(`[extractor] yt-dlp failed (${platform}): ${e.message?.slice(0, 200)}`);
     return null;
