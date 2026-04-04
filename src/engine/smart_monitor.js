@@ -13,7 +13,7 @@
 //   MONITOR_INTERVAL_MIN = 30                   ← اختياري (افتراضي 30)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const nodemailer = require('nodemailer');
+const https = require('https');
 const Anthropic  = require('@anthropic-ai/sdk');
 const path       = require('path');
 const fs         = require('fs');
@@ -23,22 +23,70 @@ const logger     = require('../middleware/logger');
 
 const INTERVAL_MS  = parseInt(process.env.MONITOR_INTERVAL_MIN || '30') * 60 * 1000;
 const ALERT_EMAIL  = process.env.ALERT_EMAIL  || '';
-const GMAIL_USER   = process.env.GMAIL_USER   || '';
-const GMAIL_PASS   = process.env.GMAIL_APP_PASSWORD || '';
 
 // منع إرسال نفس التنبيه خلال ساعة
 const _recentAlerts = new Map(); // key → timestamp
 
-// ── إنشاء transporter للإيميل ────────────────────────────────────────────────
+// ── إرسال الإيميل عبر Resend API (HTTP — يعمل على Render المجاني) ─────────────
 
-function createTransporter() {
-  if (!GMAIL_USER || !GMAIL_PASS) return null;
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+async function sendAlert({ subject, html }) {
+  if (!ALERT_EMAIL) {
+    logger.warn('[monitor] ALERT_EMAIL غير مضبوط — تخطي الإيميل');
+    return false;
+  }
+
+  const RESEND_KEY = process.env.RESEND_API_KEY || '';
+  if (!RESEND_KEY) {
+    logger.warn('[monitor] RESEND_API_KEY غير مضبوط — تخطي الإيميل');
+    return false;
+  }
+
+  const body = JSON.stringify({
+    from:    'UrDown Monitor <onboarding@resend.dev>',
+    to:      [ALERT_EMAIL],
+    subject,
+    html,
+  });
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.resend.com',
+      path:     '/emails',
+      method:   'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_KEY}`,
+        'Content-Type':  'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          logger.info(`[monitor] ✅ إيميل أُرسل عبر Resend: ${subject}`);
+          resolve(true);
+        } else {
+          logger.error(`[monitor] Resend خطأ ${res.statusCode}: ${data.slice(0, 200)}`);
+          resolve(false);
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      logger.error(`[monitor] Resend فشل الاتصال: ${e.message}`);
+      resolve(false);
+    });
+
+    req.setTimeout(15_000, () => {
+      req.destroy();
+      logger.error('[monitor] Resend timeout');
+      resolve(false);
+    });
+
+    req.write(body);
+    req.end();
   });
 }
-
 // ── جمع بيانات الكوكيز ───────────────────────────────────────────────────────
 
 function collectCookieData() {
@@ -258,30 +306,7 @@ function buildEmailHtml({ cookieData, telemetryStats, aiAnalysis, alertType }) {
 </html>`;
 }
 
-// ── إرسال الإيميل ─────────────────────────────────────────────────────────────
 
-async function sendAlert({ subject, html }) {
-  if (!ALERT_EMAIL || !GMAIL_USER || !GMAIL_PASS) {
-    logger.warn('[monitor] ALERT_EMAIL أو GMAIL_USER أو GMAIL_APP_PASSWORD غير مضبوط — تخطي الإيميل');
-    return false;
-  }
-  const transporter = createTransporter();
-  if (!transporter) return false;
-
-  try {
-    await transporter.sendMail({
-      from:    `"UrDown Monitor" <${GMAIL_USER}>`,
-      to:      ALERT_EMAIL,
-      subject,
-      html,
-    });
-    logger.info(`[monitor] ✅ إيميل أُرسل: ${subject}`);
-    return true;
-  } catch (e) {
-    logger.error(`[monitor] فشل إرسال الإيميل: ${e.message}`);
-    return false;
-  }
-}
 
 // ── منع التكرار ───────────────────────────────────────────────────────────────
 
