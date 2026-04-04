@@ -20,6 +20,47 @@ const logger = require('../middleware/logger');
 const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
 const TMP_DIR   = path.resolve(process.env.TMP_DIR || 'tmp');
 
+// ── Per-IP concurrent download limiter ───────────────────────────────────────
+// Each proxy-download holds an open yt-dlp process + HTTP stream for minutes.
+// Without this guard a single authenticated client can exhaust server memory
+// and disk by opening dozens of simultaneous proxy downloads.
+//
+// MAX_PROXY_PER_IP    — max concurrent downloads per client IP (default: 3)
+// MAX_PROXY_GLOBAL    — absolute server-wide cap across all IPs (default: 10)
+// Both are configurable via environment variables.
+
+const MAX_PER_IP = parseInt(process.env.MAX_PROXY_PER_IP  || '3',  10);
+const MAX_GLOBAL = parseInt(process.env.MAX_PROXY_GLOBAL  || '10', 10);
+
+// Map<ip, activeCount>  — in-memory, resets on server restart (acceptable).
+const _perIp   = new Map();
+let   _global  = 0;
+
+function getClientIp(req) {
+  // Trust X-Forwarded-For only if the server sits behind a known proxy (Render, etc.).
+  // Falls back to req.ip (set by express with trust proxy).
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'unknown';
+}
+
+function acquireSlot(ip) {
+  const current = _perIp.get(ip) || 0;
+  if (current >= MAX_PER_IP) return false;
+  if (_global  >= MAX_GLOBAL) return false;
+  _perIp.set(ip, current + 1);
+  _global++;
+  return true;
+}
+
+function releaseSlot(ip) {
+  const current = _perIp.get(ip) || 0;
+  if (current <= 1) {
+    _perIp.delete(ip);
+  } else {
+    _perIp.set(ip, current - 1);
+  }
+  if (_global > 0) _global--;
+}
+
 // ── SSRF protection ───────────────────────────────────────────────────────────
 const BLOCKED_HOSTS = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|::1|fd[0-9a-f]{2}:)/i;
 
@@ -186,12 +227,27 @@ router.post('/', validateApiKey, async (req, res) => {
     return res.status(400).json({ error: urlCheck.reason, code: 'invalid_url' });
   }
 
-  logger.info(`[proxy-download] ${platform || 'generic'} ${url.slice(0, 80)}`);
+  // ── Concurrency guard ────────────────────────────────────────────────────
+  const ip = getClientIp(req);
+  if (!acquireSlot(ip)) {
+    const perIpCount = _perIp.get(ip) || 0;
+    const reason = perIpCount >= MAX_PER_IP
+      ? `Too many concurrent downloads from your IP (max ${MAX_PER_IP})`
+      : `Server download capacity reached (max ${MAX_GLOBAL} concurrent)`;
+    logger.warn(`[proxy-download] slot denied ip=${ip} perIp=${perIpCount} global=${_global}`);
+    return res.status(429).json({ error: reason, code: 'concurrent_limit' });
+  }
+  // ── slot acquired — must call releaseSlot(ip) on every exit path ─────────
+
+  logger.info(`[proxy-download] ${platform || 'generic'} ip=${ip} active=perIp:${_perIp.get(ip)} global:${_global} ${url.slice(0, 80)}`);
   try {
     await proxyDownload(url, platform || 'generic', format || 'video', res, _db);
   } catch (err) {
     logger.error(`[proxy-download] failed: ${err.message}`);
     if (!res.headersSent) res.status(500).json({ error: err.message, code: 'download_failed' });
+  } finally {
+    // Always release — whether proxyDownload succeeded, threw, or the client disconnected.
+    releaseSlot(ip);
   }
 });
 

@@ -35,7 +35,9 @@ function _hash(value) {
 }
 
 function validateApiKey(req, res, next) {
-  const key = req.headers['x-api-key'] || req.query.api_key;
+  // API key must be in the X-API-Key header only.
+  // Query param fallback removed — keys in URLs appear in server access logs.
+  const key = req.headers['x-api-key'];
   if (!key) {
     return res.status(401).json({ error: 'Missing X-API-Key header', code: 'missing_key' });
   }
