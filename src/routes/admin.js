@@ -149,15 +149,14 @@ router.post('/cookies/unblock', validateAdmin, (req, res) => {
 const { runCheck, sendManualReport } = require('../engine/smart_monitor');
 
 router.get('/monitor/status', validateAdmin, async (req, res) => {
-  const emailConfigured = !!(process.env.ALERT_EMAIL && process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+  const emailConfigured = !!(process.env.ALERT_EMAIL && process.env.RESEND_API_KEY);
   const aiConfigured    = !!(process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10);
   res.json({
     ok:               true,
     email_configured: emailConfigured,
     ai_configured:    aiConfigured,
-    alert_email:      process.env.ALERT_EMAIL ? '✅ مضبوط' : '❌ غير مضبوط',
-    gmail_user:       process.env.GMAIL_USER  ? '✅ مضبوط' : '❌ غير مضبوط',
-    gmail_password:   process.env.GMAIL_APP_PASSWORD ? '✅ مضبوط' : '❌ غير مضبوط',
+    alert_email:      process.env.ALERT_EMAIL    ? '✅ مضبوط' : '❌ غير مضبوط',
+    resend_api_key:   process.env.RESEND_API_KEY ? '✅ مضبوط' : '❌ غير مضبوط',
     interval_min:     parseInt(process.env.MONITOR_INTERVAL_MIN || '30'),
     ready:            emailConfigured && aiConfigured,
   });
